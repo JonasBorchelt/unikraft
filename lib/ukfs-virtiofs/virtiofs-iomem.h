@@ -101,6 +101,10 @@ ssize_t virtiofs_pod_pgwb(const void *addr, size_t npages,
 	size_t wpages;
 	ssize_t r;
 
+	/* Writable memory cannot be exposed without a write handle. */
+	if (!(virtiofs_node_open_flags(n) & VIRTIOFS_NODE_OPEN))
+		return npages;
+
 	if (!npages)
 		return 0;
 	do {

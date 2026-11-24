@@ -133,12 +133,13 @@ int virtiofs_live_nodekind(const struct viofs_node *n,
 static
 int virtiofs_node_fetchattr(struct viofs_node *n)
 {
-	const uint32_t fl = (n->flags & VIRTIOFS_NODE_OPEN) ?
-			    FUSE_GETATTR_FH : 0;
+	const unsigned int flags = virtiofs_node_open_flags(n);
+	const __u32 fl = flags & VIRTIOFS_NODE_OPEN ? FUSE_GETATTR_FH : 0;
 	struct fuse_attr_out_trunc out;
 	const union virtiofs_fuse_attr_outp op = { .trunc = &out };
 
-	return virtiofs_fuse_getattr(&n->dev->fdev, n->inode, n->fh, fl,
+	return virtiofs_fuse_getattr(&n->dev->fdev, n->inode,
+				     fl ? n->fh : 0, fl,
 				     op, &n->attr);
 }
 
@@ -259,19 +260,25 @@ struct viofs_node *virtiofs_live_vopen(union uk_fs_vopen_vol vol,
 }
 
 static
+void virtiofs_close_handle(struct viofs_node *n, uint64_t fh)
+{
+	int r = virtiofs_fuse_release(&n->dev->fdev, n->inode, fh);
+
+	UK_ASSERT(r <= 0);
+	if (unlikely(r))
+		uk_pr_err("RELEASE(%llu) failed: %d\n",
+			  (unsigned long long)n->inode, r);
+}
+
+static
 void virtiofs_node_close(struct viofs_node *n)
 {
-	int r;
+	const unsigned int flags = virtiofs_node_open_flags(n);
 
-	if (n->flags & VIRTIOFS_NODE_OPEN) {
-		r = virtiofs_fuse_release(&n->dev->fdev, n->inode, n->fh);
-
-		UK_ASSERT(r <= 0);
-		if (unlikely(r))
-			/* We cannot fail; log error */
-			uk_pr_err("RELEASE(%" PRIu64 ") failed: %d\n",
-				  n->inode, r);
-	}
+	if (flags & VIRTIOFS_NODE_OPEN)
+		virtiofs_close_handle(n, n->fh);
+	if (flags & VIRTIOFS_NODE_READ_OPEN)
+		virtiofs_close_handle(n, n->read_fh);
 }
 
 static
@@ -340,45 +347,63 @@ void virtiofs_live_release(struct viofs_node *n)
 }
 
 static inline
-void virtiofs_commit_open(struct viofs_node *n, struct fuse_open_out *out)
+void virtiofs_commit_open(struct viofs_node *n, const struct fuse_open_out *out,
+			  unsigned int flag)
 {
-	uk_store_n(&n->fh, out->fh);
-	uk_or(&n->flags, VIRTIOFS_NODE_OPEN);
+	if (flag == VIRTIOFS_NODE_READ_OPEN)
+		n->read_fh = out->fh;
+	else
+		n->fh = out->fh;
+	__atomic_or_fetch(&n->flags, flag, __ATOMIC_RELEASE);
 }
 
-static inline
-int virtiofs_try_open(struct viofs_node *n)
+static
+int virtiofs_try_open(struct viofs_node *n, bool write, unsigned int flags)
 {
 	struct fuse_open_out out;
+	unsigned int flag = VIRTIOFS_NODE_OPEN;
+	int open_flags;
 	int r;
 
-	if (virtiofs_node_fmode(n) == S_IFDIR) {
-		r = virtiofs_fuse_open(&n->dev->fdev, n->inode,
-				       O_DIRECTORY, &out);
-	} else if (virtiofs_node_fmode(n) == S_IFLNK) {
-		r = virtiofs_fuse_open(&n->dev->fdev, n->inode,
-				       O_NOFOLLOW | O_PATH, &out);
-	} else {
-		r = virtiofs_fuse_open(&n->dev->fdev, n->inode, O_RDWR, &out);
-		if (r == -EACCES)
-			r = virtiofs_fuse_open(&n->dev->fdev, n->inode,
-					       O_RDONLY, &out);
+	switch (virtiofs_node_fmode(n)) {
+	case S_IFDIR:
+		open_flags = O_DIRECTORY;
+		break;
+	case S_IFLNK:
+		open_flags = O_NOFOLLOW | O_PATH;
+		break;
+	default:
+		open_flags = write ? O_RDWR : O_RDONLY;
+		if (!write)
+			flag = VIRTIOFS_NODE_READ_OPEN;
+		break;
 	}
-	if (!r)
-		virtiofs_commit_open(n, &out);
+	r = virtiofs_fuse_open(&n->dev->fdev, n->inode, open_flags, &out);
+	if (!r) {
+		virtiofs_commit_open(n, &out, flag);
+	} else if (open_flags == O_RDWR && !(flags & VIRTIOFS_NODE_READ_OPEN) &&
+		   (r == -EACCES || r == -EPERM || r == -EROFS)) {
+		/* Cache a read handle while preserving the write error. */
+		if (!virtiofs_fuse_open(&n->dev->fdev, n->inode,
+					O_RDONLY, &out))
+			virtiofs_commit_open(n, &out, VIRTIOFS_NODE_READ_OPEN);
+	}
 	return r;
 }
 
 static
-int virtiofs_ensure_open(struct viofs_node *n)
+int virtiofs_ensure_open(struct viofs_node *n, bool write)
 {
+	const unsigned int mask = VIRTIOFS_NODE_OPEN |
+		(write ? 0 : VIRTIOFS_NODE_READ_OPEN);
+	unsigned int flags = virtiofs_node_open_flags(n);
 	int r = 0;
 
-	if (!(n->flags & VIRTIOFS_NODE_OPEN)) {
+	if (!(flags & mask)) {
 		uk_mutex_lock(&n->openlk);
-		/* Re-check flag after acquiring lock */
-		if (!(uk_load_n(&n->flags) & VIRTIOFS_NODE_OPEN))
-			r = virtiofs_try_open(n);
+		flags = virtiofs_node_open_flags(n);
+		if (!(flags & mask))
+			r = virtiofs_try_open(n, write, flags);
 		uk_mutex_unlock(&n->openlk);
 	}
 	return r;
@@ -476,7 +501,7 @@ ssize_t virtiofs_live_read(struct viofs_node *n,
 	if (unlikely(virtiofs_node_fmode(n) == S_IFLNK))
 		return -EBADF;
 
-	r = virtiofs_ensure_open(n);
+	r = virtiofs_ensure_open(n, false);
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		return r;
@@ -570,7 +595,7 @@ ssize_t virtiofs_live_write(struct viofs_node *n,
 	if (unlikely(virtiofs_node_fmode(n) == S_IFLNK))
 		return -EBADF;
 
-	r = virtiofs_ensure_open(n);
+	r = virtiofs_ensure_open(n, true);
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		return r;
@@ -627,7 +652,7 @@ ssize_t virtiofs_live_mem(struct viofs_node *n,
 			     UK_PAGING_PAGE_SIZE;
 	const size_t npages = pgend - pgoff;
 
-	r = virtiofs_ensure_open(n);
+	r = virtiofs_ensure_open(n, op == UKFILE_MEM_RETRIEVE);
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		return r;
@@ -766,7 +791,7 @@ int virtiofs_live_setstat(struct viofs_node *n,
 	if (unlikely(mask & ~VIRTIOFS_SETTABLE_STATS))
 		return -EINVAL;
 
-	if (n->flags & VIRTIOFS_NODE_OPEN) {
+	if (virtiofs_node_open_flags(n) & VIRTIOFS_NODE_OPEN) {
 		in.fh = n->fh;
 		valid |= FATTR_FH;
 	}
@@ -806,20 +831,25 @@ int virtiofs_live_setstat(struct viofs_node *n,
 static
 int virtiofs_fsync(struct viofs_node *n, uint32_t flags)
 {
-	int r = virtiofs_ensure_open(n);
+	unsigned int open_flags;
+	__u64 fh;
+	int r = virtiofs_ensure_open(n, false);
 
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		return r;
-	/* Writeback any local iomem */
-	if (virtiofs_node_fmode(n) == S_IFREG) {
+	open_flags = virtiofs_node_open_flags(n);
+	/* Write back local iomem only when a writable handle exists. */
+	if (virtiofs_node_fmode(n) == S_IFREG &&
+	    (open_flags & VIRTIOFS_NODE_OPEN)) {
 		r = virtiofs_iomem_sync(&viofs_node2reg(n)->iomem, n);
 		UK_ASSERT(r <= 0);
 		if (unlikely(r))
 			return r;
 	}
 	/* Send fsync to device */
-	return virtiofs_fuse_fsync(&n->dev->fdev, n->inode, n->fh, flags);
+	fh = open_flags & VIRTIOFS_NODE_OPEN ? n->fh : n->read_fh;
+	return virtiofs_fuse_fsync(&n->dev->fdev, n->inode, fh, flags);
 }
 
 static
@@ -833,7 +863,7 @@ int virtiofs_ftrunc(struct viofs_node *n, uint64_t len)
 
 	in.size = len;
 	in.valid = FATTR_SIZE;
-	if (n->flags & VIRTIOFS_NODE_OPEN) {
+	if (virtiofs_node_open_flags(n) & VIRTIOFS_NODE_OPEN) {
 		in.fh = n->fh;
 		in.valid |= FATTR_FH;
 	}
@@ -863,7 +893,7 @@ int virtiofs_falloc(struct viofs_node *n, uint32_t mode,
 	if (unlikely(virtiofs_node_fmode(n) != S_IFREG))
 		return -ENODEV;
 
-	r = virtiofs_ensure_open(n);
+	r = virtiofs_ensure_open(n, true);
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		return r;
@@ -893,9 +923,6 @@ int virtiofs_falloc(struct viofs_node *n, uint32_t mode,
 	}
 #endif /* CONFIG_LIBUKFS_VIRTIOFS_IOMEM */
 
-	r = virtiofs_ensure_open(n);
-	if (unlikely(r))
-		return r;
 	r = virtiofs_fuse_fallocate(&n->dev->fdev, n->inode, n->fh,
 				    off, len, mode);
 	UK_ASSERT(r <= 0);
@@ -1193,7 +1220,7 @@ ssize_t virtiofs_live_fs_listdir(struct viofs_node *n, size_t *curp,
 		tmplen = MIN(len, max_stacklen);
 	}
 
-	r = virtiofs_ensure_open(n);
+	r = virtiofs_ensure_open(n, false);
 	UK_ASSERT(r <= 0);
 	if (unlikely(r))
 		goto out;
@@ -1303,8 +1330,10 @@ struct viofs_node *virtiofs_live_fs_create(struct viofs_node *n,
 	}
 	case S_IFREG: /* create */
 	{
+		const int access_mode = (flags & O_ACCMODE) == O_RDONLY ?
+			O_RDONLY : O_RDWR;
 		const struct fuse_create_in in = {
-			.flags = flags | O_RDWR,
+			.flags = (flags & ~O_ACCMODE) | access_mode,
 			.mode = mode,
 			.umask = 0 /* umask is already applied into mode */
 		};
@@ -1329,8 +1358,11 @@ struct viofs_node *virtiofs_live_fs_create(struct viofs_node *n,
 
 		virtiofs_live_acquire(n);
 		virtiofs_init_node(newnode, n->dev, entry_out.nodeid, n);
-		UK_ASSERT(virtiofs_node_fmode(n) == S_IFREG);
-		virtiofs_commit_open(newnode, &open_out);
+		UK_ASSERT(virtiofs_node_fmode(newnode) == S_IFREG);
+		virtiofs_commit_open(newnode, &open_out,
+				     access_mode == O_RDONLY ?
+				     VIRTIOFS_NODE_READ_OPEN :
+				     VIRTIOFS_NODE_OPEN);
 		uk_mutex_lock(&n->dev->maplk);
 		UK_RB_INSERT(virtiofs_nodemap, &n->dev->nodemap, newnode);
 		uk_mutex_unlock(&n->dev->maplk);

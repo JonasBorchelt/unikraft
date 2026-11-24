@@ -21,12 +21,14 @@
 #define virtiofs_alloc uk_alloc_get_default()
 
 #define VIRTIOFS_NODE_OPEN	1
+#define VIRTIOFS_NODE_READ_OPEN	2
 
 struct viofs_dev;
 
 struct viofs_node {
 	uint64_t inode;
 	uint64_t fh;
+	__u64 read_fh;
 	UK_RB_ENTRY(viofs_node) rb_entry; /* Link in inode mapping */
 	struct viofs_dev *dev;
 	struct viofs_node *parent;
@@ -99,17 +101,31 @@ int virtiofs_rb_dev_cmp(struct uk_virtiofs_dev *a, struct uk_virtiofs_dev *b)
 }
 
 static inline
+unsigned int virtiofs_node_open_flags(const struct viofs_node *n)
+{
+	return __atomic_load_n(&n->flags, __ATOMIC_ACQUIRE);
+}
+
+static inline
+uint64_t virtiofs_node_read_handle(const struct viofs_node *n)
+{
+	unsigned int flags = virtiofs_node_open_flags(n);
+
+	UK_ASSERT(flags & (VIRTIOFS_NODE_OPEN | VIRTIOFS_NODE_READ_OPEN));
+	return flags & VIRTIOFS_NODE_READ_OPEN ? n->read_fh : n->fh;
+}
+
+static inline
 ssize_t virtiofs_file_read(struct viofs_node *n, size_t off, size_t len,
 			   const struct iovec *iov, size_t iovcnt, long flags)
 {
 	const struct fuse_read_in in = {
-		.fh = n->fh,
+		.fh = virtiofs_node_read_handle(n),
 		.offset = off,
 		.size = len,
 		.flags = flags
 	};
 
-	UK_ASSERT(n->flags & VIRTIOFS_NODE_OPEN);
 	return virtiofs_fuse_read(&n->dev->fdev, n->inode, &in, iov, iovcnt);
 }
 
@@ -124,7 +140,7 @@ ssize_t virtiofs_file_write(struct viofs_node *n, size_t off, size_t len,
 		.flags = flags
 	};
 
-	UK_ASSERT(n->flags & VIRTIOFS_NODE_OPEN);
+	UK_ASSERT(virtiofs_node_open_flags(n) & VIRTIOFS_NODE_OPEN);
 	return virtiofs_fuse_write(&n->dev->fdev, n->inode, &in, iov, iovcnt);
 }
 
